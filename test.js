@@ -42,6 +42,7 @@ class SystemTest {
       { name: 'Publishing Safety', test: () => this.testPublishingSafety() },
       { name: 'Multi-Provider Credential Validation', test: () => this.testCredentialValidation() },
       { name: 'AI Text Service Token Compatibility', test: () => this.testAITextServiceTokenParams() },
+      { name: 'Custom AI Provider (9router-style)', test: () => this.testCustomAIProvider() },
       { name: 'Placeholder Scheduling Guard', test: () => this.testPlaceholderSchedulingGuard() },
       { name: 'FFmpeg Resolution', test: () => this.testFFmpegResolution() },
       { name: 'Gemini Media Provider Selection', test: () => this.testGeminiMediaProvider() },
@@ -2306,6 +2307,130 @@ class SystemTest {
     }
 
     this.logger.info('AI text service token parameter test completed successfully');
+  }
+
+  async testCustomAIProvider() {
+    const { AITextService } = require('./utils/ai-text-service');
+
+    const envKeys = [
+      'CUSTOM_AI_PROVIDER_ENABLED',
+      'CUSTOM_AI_BASE_URL',
+      'CUSTOM_AI_API_KEY',
+      'CUSTOM_AI_MODEL',
+      'CUSTOM_AI_MODEL_FALLBACK',
+      'CUSTOM_AI_TIMEOUT_MS',
+      'OPENAI_API_KEY'
+    ];
+    const savedEnv = {};
+    for (const key of envKeys) savedEnv[key] = process.env[key];
+
+    try {
+      // FR1/FR6: the master switch takes priority over every other configured
+      // provider, and only an .env change is needed to point at it.
+      process.env.CUSTOM_AI_PROVIDER_ENABLED = 'true';
+      process.env.CUSTOM_AI_BASE_URL = 'https://rct9b4h.abc-tunnel.us/v1';
+      process.env.CUSTOM_AI_API_KEY = 'super-secret-9router-key';
+      process.env.CUSTOM_AI_MODEL = 'ag/gemini-3.7-flash-medium';
+      process.env.CUSTOM_AI_MODEL_FALLBACK = 'ag/gemini-3.6-flash-medium';
+      process.env.CUSTOM_AI_TIMEOUT_MS = '60000';
+      process.env.OPENAI_API_KEY = 'sk-should-be-ignored';
+
+      const service = new AITextService({
+        aiProvider: { provider: 'openrouter', apiKey: 'sk-or-should-be-ignored', model: 'openai/gpt-5.6-sol' }
+      });
+
+      if (!service.isCustomProvider) throw new Error('Custom AI provider was not selected despite CUSTOM_AI_PROVIDER_ENABLED=true');
+      if (service.model !== 'ag/gemini-3.7-flash-medium') throw new Error('CUSTOM_AI_MODEL was not used as the primary model');
+      if (service.fallbackModel !== 'ag/gemini-3.6-flash-medium') throw new Error('CUSTOM_AI_MODEL_FALLBACK was not captured');
+      if (service.client.baseURL !== 'https://rct9b4h.abc-tunnel.us/v1') throw new Error('CUSTOM_AI_BASE_URL was not applied to the SDK client');
+
+      const { CredentialManager } = require('./utils/credential-manager');
+      const manager = new CredentialManager();
+      manager.credentials = { youtube: { client_id: 'x' } };
+      if (!manager.hasAITextProvider()) throw new Error('CredentialManager did not recognize the enabled custom AI provider');
+      if (manager.getMissingCredentials().length !== 0) throw new Error('An enabled custom AI provider was incorrectly reported as a missing credential');
+
+      // FR2: every completion call must use CUSTOM_AI_MODEL.
+      const calls = [];
+      service.client.chat.completions.create = async (params) => {
+        calls.push(params);
+        return { choices: [{ message: { content: 'router-ok' } }] };
+      };
+      const result = await service.generateText('prompt');
+      if (result !== 'router-ok') throw new Error('generateText did not return the custom provider content');
+      if (calls[0].model !== 'ag/gemini-3.7-flash-medium') throw new Error('Request did not use CUSTOM_AI_MODEL');
+
+      // FR3: a primary-model error retries once against CUSTOM_AI_MODEL_FALLBACK
+      // before surfacing failure.
+      const fallbackCalls = [];
+      service.client.chat.completions.create = async (params) => {
+        fallbackCalls.push(params);
+        if (params.model === 'ag/gemini-3.7-flash-medium') {
+          const err = new Error('model alias not found');
+          err.status = 404;
+          throw err;
+        }
+        return { choices: [{ message: { content: 'fallback-ok' } }] };
+      };
+      const fallbackResult = await service.generateText('prompt');
+      if (fallbackResult !== 'fallback-ok') throw new Error('Fallback model retry did not return content');
+      if (fallbackCalls.length !== 2 || fallbackCalls[1].model !== 'ag/gemini-3.6-flash-medium') {
+        throw new Error('Expected exactly one retry against the fallback model');
+      }
+
+      // FR5: when both models fail, the thrown error must classify the cause
+      // and must never contain the API key.
+      service.client.chat.completions.create = async () => {
+        const err = new Error('Incorrect API key provided: super-secret-9router-key');
+        err.status = 401;
+        throw err;
+      };
+      let authError = null;
+      try {
+        await service.generateText('prompt');
+      } catch (error) {
+        authError = error;
+      }
+      if (!authError) throw new Error('Expected an error when both custom-provider models reject the API key');
+      if (!/rejected the API key/i.test(authError.message)) throw new Error('401 was not classified as a bad API key');
+      if (authError.message.includes('super-secret-9router-key')) throw new Error('API key leaked into the thrown error message');
+
+      // Unreachable tunnel/network errors must be classified distinctly.
+      service.client.chat.completions.create = async () => {
+        const err = new Error('connect ECONNREFUSED 127.0.0.1:443');
+        err.code = 'ECONNREFUSED';
+        throw err;
+      };
+      let networkError = null;
+      try {
+        await service.generateText('prompt');
+      } catch (error) {
+        networkError = error;
+      }
+      if (!networkError || !/unreachable/i.test(networkError.message)) {
+        throw new Error('A connection failure was not classified as "unreachable"');
+      }
+    } finally {
+      for (const key of envKeys) {
+        if (savedEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = savedEnv[key];
+      }
+    }
+
+    // Master switch off: existing provider selection must be unaffected.
+    delete process.env.CUSTOM_AI_PROVIDER_ENABLED;
+    const savedOpenAIKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'sk-test';
+    try {
+      const service = new AITextService({});
+      if (service.isCustomProvider) throw new Error('Custom provider was selected even though CUSTOM_AI_PROVIDER_ENABLED was not set');
+      if (service.providerName !== 'OpenAI') throw new Error('Disabling the custom provider did not fall back to the existing provider selection');
+    } finally {
+      if (savedOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = savedOpenAIKey;
+    }
+
+    this.logger.info('Custom AI provider test completed successfully');
   }
 
   async testPlaceholderSchedulingGuard() {

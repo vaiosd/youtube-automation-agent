@@ -513,6 +513,11 @@ class CredentialManager {
   }
   // Validation methods
   hasAITextProvider() {
+    const customEnabled = /^(1|true|yes)$/i.test(String(process.env.CUSTOM_AI_PROVIDER_ENABLED || '').trim());
+    if (customEnabled && process.env.CUSTOM_AI_BASE_URL && process.env.CUSTOM_AI_MODEL) {
+      return true;
+    }
+
     if (this.credentials.openai?.apiKey || this.credentials.gemini?.apiKey || this.credentials.aiProvider?.apiKey) {
       return true;
     }

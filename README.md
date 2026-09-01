@@ -241,8 +241,11 @@ graph LR
 | **Kimi (Moonshot AI)** | Kimi K3, K2.7 Code, K2.6 | `api.moonshot.ai/v1` | provider pricing |
 | **MiMo (Xiaomi)** | MiMo V2.5 Pro, V2.5 | `api.xiaomimimo.com/v1` | provider pricing |
 | **GLM (Zhipu AI)** | GLM-5.3, 5.2, 5.1 | `api.z.ai/api/paas/v4/` | provider pricing |
+| **Custom (self-hosted)** | Any model alias your proxy exposes | Whatever `CUSTOM_AI_BASE_URL` points at | your infrastructure |
 
 Additional integrations: Anthropic Claude (`claude-fable-5`), ElevenLabs (Eleven v3 TTS), Replicate (Wan 2.7 video), local models via Ollama, any OpenAI-compatible endpoint.
+
+Set `CUSTOM_AI_PROVIDER_ENABLED=true` in `.env` to route every text-generation call through a self-hosted OpenAI-compatible proxy (e.g. 9router) instead of the providers above — no code change needed. See `.env.example` for `CUSTOM_AI_BASE_URL`, `CUSTOM_AI_API_KEY`, `CUSTOM_AI_MODEL`, `CUSTOM_AI_MODEL_FALLBACK`, and `CUSTOM_AI_TIMEOUT_MS`. A model error is retried once against the fallback model before failing; the production readiness check probes this provider like any other.
 
 ### AI video providers
 

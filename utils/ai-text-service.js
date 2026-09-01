@@ -53,11 +53,19 @@ class AITextService {
     this.gemini = null;
     this.model = null;
     this.providerName = null;
+    this.isCustomProvider = false;
+    this.fallbackModel = null;
+    this._customApiKey = null;
 
     this._init(credentials);
   }
 
   _init(credentials) {
+    const customConfig = this._getCustomProviderConfig();
+    if (customConfig) {
+      return this._initCustomProvider(customConfig);
+    }
+
     const provider = credentials.aiProvider?.provider;
     const apiKey = credentials.aiProvider?.apiKey;
     const model = credentials.aiProvider?.model;
@@ -86,6 +94,47 @@ class AITextService {
     this.model = model || preset.defaultModel;
     this.providerName = preset.name;
     this.logger.info(`${preset.name} initialized (model: ${this.model})`);
+  }
+
+  // Self-hosted OpenAI-compatible proxy (e.g. 9router). Master-switched via
+  // CUSTOM_AI_PROVIDER_ENABLED so the built-in provider selection above stays
+  // untouched when it's off.
+  _getCustomProviderConfig() {
+    const enabled = /^(1|true|yes)$/i.test(String(process.env.CUSTOM_AI_PROVIDER_ENABLED || '').trim());
+    if (!enabled) return null;
+
+    const baseURL = String(process.env.CUSTOM_AI_BASE_URL || '').trim();
+    const model = String(process.env.CUSTOM_AI_MODEL || '').trim();
+    if (!baseURL || !model) {
+      this.logger.warn('CUSTOM_AI_PROVIDER_ENABLED is true but CUSTOM_AI_BASE_URL or CUSTOM_AI_MODEL is missing — ignoring custom provider');
+      return null;
+    }
+
+    const fallbackModel = String(process.env.CUSTOM_AI_MODEL_FALLBACK || '').trim() || null;
+    const timeoutMs = Math.max(1000, Number(process.env.CUSTOM_AI_TIMEOUT_MS) || 60000);
+    return { apiKey: process.env.CUSTOM_AI_API_KEY || '', baseURL, model, fallbackModel, timeoutMs };
+  }
+
+  _initCustomProvider(config) {
+    try {
+      this.client = new OpenAI({
+        apiKey: config.apiKey || 'unset',
+        baseURL: config.baseURL,
+        timeout: config.timeoutMs,
+      });
+      this.model = config.model;
+      this.fallbackModel = config.fallbackModel && config.fallbackModel !== config.model ? config.fallbackModel : null;
+      this.providerName = 'Custom AI provider';
+      this.isCustomProvider = true;
+      // Kept only to strip literal occurrences from error/log text — the key
+      // itself is never logged (FR5).
+      this._customApiKey = config.apiKey || null;
+      this.logger.info(
+        `Custom AI provider initialized (baseURL: ${config.baseURL}, model: ${this.model}${this.fallbackModel ? `, fallback: ${this.fallbackModel}` : ''})`
+      );
+    } catch (error) {
+      this.logger.error('Failed to initialize custom AI provider:', error.message);
+    }
   }
 
   _initGemini(apiKey, model) {
@@ -126,6 +175,35 @@ class AITextService {
       throw new Error('No AI text provider configured');
     }
 
+    if (this.isCustomProvider && !options.model) {
+      return this._generateWithFallback(prompt, model, maxTokens, temperature);
+    }
+
+    return this._chatComplete(model, prompt, maxTokens, temperature);
+  }
+
+  // Retries once against CUSTOM_AI_MODEL_FALLBACK when the primary custom-provider
+  // model errors, mirroring the bounded-retry shape used for generation stages
+  // (see GENERATION_STAGE_MAX_ATTEMPTS in generation-recovery-service.js).
+  async _generateWithFallback(prompt, primaryModel, maxTokens, temperature) {
+    try {
+      return await this._chatComplete(primaryModel, prompt, maxTokens, temperature);
+    } catch (error) {
+      if (!this.fallbackModel) {
+        throw this._describeCustomProviderError(error);
+      }
+      this.logger.warn(
+        `Custom AI provider model "${primaryModel}" failed (${this._safeErrorSummary(error)}); retrying with fallback "${this.fallbackModel}"`
+      );
+      try {
+        return await this._chatComplete(this.fallbackModel, prompt, maxTokens, temperature);
+      } catch (fallbackError) {
+        throw this._describeCustomProviderError(fallbackError, true);
+      }
+    }
+  }
+
+  async _chatComplete(model, prompt, maxTokens, temperature) {
     const params = {
       model,
       messages: [{ role: 'user', content: prompt }],
@@ -156,6 +234,54 @@ class AITextService {
       }
       throw error;
     }
+  }
+
+  // Redacts anything that looks like a credential before it can reach logs or
+  // a thrown error message (FR5: never write the API key itself into logs).
+  _redact(text) {
+    let out = String(text || '')
+      .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [redacted]')
+      .replace(/"?api[_-]?key"?\s*[:=]\s*"?[A-Za-z0-9._~-]+"?/gi, 'api_key=[redacted]');
+    // Belt-and-suspenders: strip literal occurrences of the configured key too,
+    // in case an upstream error echoes it back in free-form text.
+    if (this._customApiKey) {
+      out = out.split(this._customApiKey).join('[redacted]');
+    }
+    return out;
+  }
+
+  _safeErrorSummary(error) {
+    const status = error?.status || error?.response?.status;
+    const rawBody =
+      (error && typeof error.error === 'object' && error.error) ? JSON.stringify(error.error) : (error?.message || String(error));
+    const body = this._redact(rawBody).slice(0, 300);
+    return status ? `HTTP ${status}: ${body}` : body;
+  }
+
+  // Classifies the failure (tunnel unreachable vs. bad key vs. unknown model
+  // alias vs. upstream error) so the readiness check and logs surface an
+  // actionable cause instead of a generic "request failed".
+  _describeCustomProviderError(error, afterFallback = false) {
+    const status = error?.status || error?.response?.status;
+    const code = error?.code || error?.cause?.code;
+    const message = String(error?.message || '');
+    const summary = this._safeErrorSummary(error);
+
+    let category = 'Custom AI provider request failed';
+    if (code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'ETIMEDOUT' || code === 'ECONNRESET' || /timeout/i.test(message)) {
+      category = 'Custom AI provider unreachable (tunnel or network error)';
+    } else if (status === 401 || status === 403) {
+      category = 'Custom AI provider rejected the API key';
+    } else if (status === 404 || /model/i.test(message)) {
+      category = 'Custom AI provider model alias not found';
+    } else if (typeof status === 'number' && status >= 500) {
+      category = 'Custom AI provider upstream server error';
+    }
+
+    const wrapped = new Error(`${category}${afterFallback ? ' (fallback model also failed)' : ''}: ${summary}`);
+    wrapped.status = status;
+    wrapped.cause = error;
+    return wrapped;
   }
 
   _extractContent(response) {
