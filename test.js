@@ -2328,7 +2328,7 @@ class SystemTest {
       // FR1/FR6: the master switch takes priority over every other configured
       // provider, and only an .env change is needed to point at it.
       process.env.CUSTOM_AI_PROVIDER_ENABLED = 'true';
-      process.env.CUSTOM_AI_BASE_URL = 'https://rct9b4h.abc-tunnel.us/v1';
+      process.env.CUSTOM_AI_BASE_URL = 'https://example.com/v1';
       process.env.CUSTOM_AI_API_KEY = 'super-secret-9router-key';
       process.env.CUSTOM_AI_MODEL = 'ag/gemini-3.7-flash-medium';
       process.env.CUSTOM_AI_MODEL_FALLBACK = 'ag/gemini-3.6-flash-medium';
@@ -2342,7 +2342,7 @@ class SystemTest {
       if (!service.isCustomProvider) throw new Error('Custom AI provider was not selected despite CUSTOM_AI_PROVIDER_ENABLED=true');
       if (service.model !== 'ag/gemini-3.7-flash-medium') throw new Error('CUSTOM_AI_MODEL was not used as the primary model');
       if (service.fallbackModel !== 'ag/gemini-3.6-flash-medium') throw new Error('CUSTOM_AI_MODEL_FALLBACK was not captured');
-      if (service.client.baseURL !== 'https://rct9b4h.abc-tunnel.us/v1') throw new Error('CUSTOM_AI_BASE_URL was not applied to the SDK client');
+      if (service.client.baseURL !== 'https://example.com/v1') throw new Error('CUSTOM_AI_BASE_URL was not applied to the SDK client');
 
       const { CredentialManager } = require('./utils/credential-manager');
       const manager = new CredentialManager();
