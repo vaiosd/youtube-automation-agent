@@ -43,6 +43,7 @@ class SystemTest {
       { name: 'Multi-Provider Credential Validation', test: () => this.testCredentialValidation() },
       { name: 'AI Text Service Token Compatibility', test: () => this.testAITextServiceTokenParams() },
       { name: 'Custom AI Provider (9router-style)', test: () => this.testCustomAIProvider() },
+      { name: 'Custom AI Provider Image Generation', test: () => this.testCustomAIProviderImage() },
       { name: 'Placeholder Scheduling Guard', test: () => this.testPlaceholderSchedulingGuard() },
       { name: 'FFmpeg Resolution', test: () => this.testFFmpegResolution() },
       { name: 'Gemini Media Provider Selection', test: () => this.testGeminiMediaProvider() },
@@ -2580,6 +2581,94 @@ class SystemTest {
     }
 
     this.logger.info('Gemini media provider selection test completed successfully');
+  }
+
+  async testCustomAIProviderImage() {
+    const { AIVideoGenerator } = require('./utils/ai-video-generator');
+    const fs = require('fs').promises;
+    const os = require('os');
+    const sharp = require('sharp');
+
+    const envKeys = ['CUSTOM_AI_PROVIDER_ENABLED', 'CUSTOM_AI_BASE_URL', 'CUSTOM_AI_API_KEY', 'CUSTOM_AI_IMAGE_MODEL', 'CUSTOM_AI_TIMEOUT_MS'];
+    const savedEnv = {};
+    for (const key of envKeys) savedEnv[key] = process.env[key];
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'yaa-custom-image-'));
+
+    try {
+      process.env.CUSTOM_AI_PROVIDER_ENABLED = 'true';
+      process.env.CUSTOM_AI_BASE_URL = 'https://example.com/v1';
+      process.env.CUSTOM_AI_API_KEY = 'super-secret-image-key';
+      process.env.CUSTOM_AI_IMAGE_MODEL = 'ag/gemini-3.1-flash-image';
+
+      const generator = new AIVideoGenerator({});
+      if (!generator.customImageClient) throw new Error('Custom AI provider image client was not initialized from CUSTOM_AI_IMAGE_MODEL');
+      if (generator.customImageModel !== 'ag/gemini-3.1-flash-image') throw new Error('CUSTOM_AI_IMAGE_MODEL was not captured');
+
+      const pngBuffer = await sharp({ create: { width: 64, height: 32, channels: 3, background: '#00ff00' } }).png().toBuffer();
+      const dataUrl = `data:image/png;base64,${pngBuffer.toString('base64')}`;
+
+      // Shape 1: OpenRouter-style message.images[].image_url.url — and the
+      // request must carry a token budget and modalities (silent empty
+      // responses were observed against the live 9router endpoint without one).
+      let capturedRequest = null;
+      generator.customImageClient.chat.completions.create = async (request) => {
+        capturedRequest = request;
+        return { choices: [{ message: { role: 'assistant', content: '', images: [{ type: 'image_url', image_url: { url: dataUrl } }] } }] };
+      };
+      const outputPath1 = path.join(directory, 'shape1.png');
+      await generator.generateImage('a green rectangle', outputPath1);
+      const meta1 = await sharp(outputPath1).metadata();
+      if (meta1.width !== 64 || meta1.height !== 32) throw new Error('Custom provider image (images[] shape) was not decoded correctly');
+      if (capturedRequest.model !== 'ag/gemini-3.1-flash-image') throw new Error('Request did not use CUSTOM_AI_IMAGE_MODEL');
+      if (!capturedRequest.max_tokens) throw new Error('Request must include a max_tokens budget or the endpoint returns an empty completion');
+      if (!Array.isArray(capturedRequest.modalities) || !capturedRequest.modalities.includes('image')) throw new Error('Request did not request image modality');
+
+      // Shape 2: content[] parts with inline_data (Gemini-native-style passthrough)
+      generator.customImageClient.chat.completions.create = async () => ({
+        choices: [{ message: { role: 'assistant', content: [{ type: 'image', inline_data: { mime_type: 'image/png', data: pngBuffer.toString('base64') } }] } }]
+      });
+      const outputPath2 = path.join(directory, 'shape2.png');
+      await generator.generateImage('a green rectangle', outputPath2);
+      const meta2 = await sharp(outputPath2).metadata();
+      if (meta2.width !== 64 || meta2.height !== 32) throw new Error('Custom provider image (content[] inline_data shape) was not decoded correctly');
+
+      // No recognizable image data anywhere in the response: falls back to
+      // another configured provider rather than silently producing nothing.
+      generator.customImageClient.chat.completions.create = async () => ({ choices: [{ message: { role: 'assistant', content: '' } }] });
+      generator.openai = {
+        images: {
+          generate: async () => ({ data: [{ b64_json: pngBuffer.toString('base64') }] })
+        }
+      };
+      const outputPath3 = path.join(directory, 'fallback.png');
+      await generator.generateImage('a green rectangle', outputPath3);
+      const meta3 = await sharp(outputPath3).metadata();
+      if (meta3.width !== 64) throw new Error('Failure did not fall back to the OpenAI image provider');
+
+      // With no fallback provider configured, the failure must surface, not
+      // be swallowed.
+      generator.openai = null;
+      generator.gemini = null;
+      let threw = false;
+      try {
+        await generator.generateImage('a green rectangle', path.join(directory, 'no-fallback.png'));
+      } catch (error) {
+        threw = true;
+      }
+      if (!threw) throw new Error('A custom-provider image failure with no fallback provider did not surface as an error');
+
+      // The configured API key must never leak into a logged/thrown error.
+      const redacted = generator._redactCustomImageError(new Error('Incorrect API key provided: super-secret-image-key'));
+      if (redacted.includes('super-secret-image-key')) throw new Error('API key leaked into the redacted image error message');
+    } finally {
+      for (const key of envKeys) {
+        if (savedEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = savedEnv[key];
+      }
+      await fs.rm(directory, { recursive: true, force: true }).catch(() => {});
+    }
+
+    this.logger.info('Custom AI provider image generation test completed successfully');
   }
 
   async testSlideshowRenderer() {

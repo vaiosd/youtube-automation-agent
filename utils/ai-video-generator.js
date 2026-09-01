@@ -45,7 +45,25 @@ class AIVideoGenerator {
         this.logger.warn('Failed to initialize Gemini media service:', error.message);
       }
     }
-    
+
+    // Custom OpenAI-compatible provider (e.g. 9router) — opt-in image generation,
+    // separate from CUSTOM_AI_MODEL (text) since not every text-capable alias
+    // there also generates images. Takes priority over OpenAI/Gemini for images
+    // when set, matching the priority custom text gets in ai-text-service.js.
+    const customEnabled = /^(1|true|yes)$/i.test(String(process.env.CUSTOM_AI_PROVIDER_ENABLED || '').trim());
+    const customImageModel = String(process.env.CUSTOM_AI_IMAGE_MODEL || '').trim();
+    const customBaseURL = String(process.env.CUSTOM_AI_BASE_URL || '').trim();
+    if (customEnabled && customBaseURL && customImageModel) {
+      this.customImageModel = customImageModel;
+      this._customImageApiKey = process.env.CUSTOM_AI_API_KEY || null;
+      this.customImageClient = new OpenAI({
+        apiKey: this._customImageApiKey || 'unset',
+        baseURL: customBaseURL,
+        timeout: Math.max(1000, Number(process.env.CUSTOM_AI_TIMEOUT_MS) || 60000),
+      });
+      this.logger.info(`Custom AI provider image generation initialized (model: ${customImageModel})`);
+    }
+
     // ElevenLabs configuration
     this.elevenLabsApiKey = resolvedCredentials.elevenLabs?.apiKey || process.env.ELEVENLABS_API_KEY;
     this.elevenLabsVoiceId = resolvedCredentials.elevenLabs?.voiceId || process.env.ELEVENLABS_VOICE_ID;
@@ -195,7 +213,7 @@ class AIVideoGenerator {
     this.logger.info(`Generating ${count} visual assets with style: ${style}`);
 
     try {
-      if (!this.openai && !this.gemini) {
+      if (!this.customImageClient && !this.openai && !this.gemini) {
         return await this.simulateVisualAssets(prompt, style, count);
       }
 
@@ -219,6 +237,15 @@ class AIVideoGenerator {
   async generateImage(prompt, imagePath) {
     await fs.mkdir(path.dirname(imagePath), { recursive: true });
 
+    if (this.customImageClient) {
+      try {
+        return await this.generateCustomProviderImage(prompt, imagePath);
+      } catch (error) {
+        if (!this.openai && !this.gemini) throw error;
+        this.logger.warn(`Custom AI provider image generation failed (${this._redactCustomImageError(error)}); falling back to ${this.openai ? 'OpenAI' : 'Gemini'}`);
+      }
+    }
+
     if (this.openai) {
       return await this.generateOpenAIImage(prompt, imagePath);
     }
@@ -228,6 +255,85 @@ class AIVideoGenerator {
     }
 
     throw new Error('No image generation provider configured');
+  }
+
+  async generateCustomProviderImage(prompt, imagePath) {
+    // Requires an explicit max_tokens/max_completion_tokens budget — without one
+    // this endpoint has been observed to return an empty completion instead of
+    // an error, silently producing no image.
+    const response = await this.customImageClient.chat.completions.create({
+      model: this.customImageModel,
+      messages: [{ role: 'user', content: prompt }],
+      modalities: ['image', 'text'],
+      max_tokens: 4096
+    });
+
+    const message = response.choices?.[0]?.message || {};
+    const dataUrl = this.extractCustomProviderImageData(message);
+    if (!dataUrl) {
+      throw new Error(`Custom AI provider image model returned no recognizable image data (message keys: ${Object.keys(message).join(', ') || 'none'})`);
+    }
+
+    let buffer;
+    const dataUrlMatch = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+    if (dataUrlMatch) {
+      buffer = Buffer.from(dataUrlMatch[2], 'base64');
+    } else if (/^https?:\/\//.test(dataUrl)) {
+      await this.downloadImage(dataUrl, imagePath);
+      return imagePath;
+    } else {
+      buffer = Buffer.from(dataUrl, 'base64');
+    }
+
+    const metadata = await sharp(buffer, { failOn: 'error' }).metadata();
+    if (!metadata.width || !metadata.height) {
+      throw new Error('Custom AI provider image model returned an invalid image asset');
+    }
+
+    const extension = path.extname(imagePath).toLowerCase();
+    const output = sharp(buffer, { failOn: 'error' });
+    if (extension === '.jpg' || extension === '.jpeg') {
+      await output.jpeg({ quality: 92 }).toFile(imagePath);
+    } else if (extension === '.webp') {
+      await output.webp({ quality: 92 }).toFile(imagePath);
+    } else {
+      await output.png().toFile(imagePath);
+    }
+    return imagePath;
+  }
+
+  // The exact response shape for image-output models varies by proxy/backend
+  // (OpenRouter-style `message.images[]`, multimodal `content[]` parts, or a
+  // bare data/HTTP URL in `content`) — check each rather than assuming one.
+  extractCustomProviderImageData(message) {
+    if (Array.isArray(message.images) && message.images.length) {
+      for (const image of message.images) {
+        if (typeof image === 'string') return image;
+        if (image?.image_url?.url) return image.image_url.url;
+        if (image?.url) return image.url;
+      }
+    }
+
+    if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part?.image_url?.url) return part.image_url.url;
+        if (part?.inline_data?.data) return `data:${part.inline_data.mime_type || 'image/png'};base64,${part.inline_data.data}`;
+        if (part?.inlineData?.data) return `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`;
+      }
+    }
+
+    if (typeof message.content === 'string' && message.content.trim()) {
+      const trimmed = message.content.trim();
+      if (/^data:image\//.test(trimmed) || /^https?:\/\//.test(trimmed)) return trimmed;
+    }
+
+    return null;
+  }
+
+  _redactCustomImageError(error) {
+    let text = String(error?.message || error);
+    if (this._customImageApiKey) text = text.split(this._customImageApiKey).join('[redacted]');
+    return text.replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [redacted]').slice(0, 300);
   }
 
   async generateOpenAIImage(prompt, imagePath) {

@@ -247,6 +247,8 @@ Additional integrations: Anthropic Claude (`claude-fable-5`), ElevenLabs (Eleven
 
 Set `CUSTOM_AI_PROVIDER_ENABLED=true` in `.env` to route every text-generation call through a self-hosted OpenAI-compatible proxy (e.g. 9router) instead of the providers above — no code change needed. See `.env.example` for `CUSTOM_AI_BASE_URL`, `CUSTOM_AI_API_KEY`, `CUSTOM_AI_MODEL`, `CUSTOM_AI_MODEL_FALLBACK`, and `CUSTOM_AI_TIMEOUT_MS`. A model error is retried once against the fallback model before failing; the production readiness check probes this provider like any other.
 
+Optionally set `CUSTOM_AI_IMAGE_MODEL` to an image-output-capable alias on the same proxy (e.g. 9router's `ag/gemini-3.1-flash-image`) to also route image generation there instead of OpenAI/Gemini. Not every text alias supports image output, so this is opt-in and separate from `CUSTOM_AI_MODEL`; on failure it falls back to OpenAI/Gemini if configured.
+
 ### AI video providers
 
 Local slideshow rendering remains the default, so upgrading does not start paid video requests. Choose a provider in **Channel setup**, set a paid-seconds cap, then run the separately opted-in paid video readiness probe.

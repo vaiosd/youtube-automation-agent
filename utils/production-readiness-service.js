@@ -145,7 +145,7 @@ class ProductionReadinessService {
   async probeImage(tempDir, includePaidMedia) {
     if (this.probes.image) return this.probes.image({ tempDir, includePaidMedia });
     const generator = new AIVideoGenerator(this.credentialManager.credentials || {});
-    if (!generator.openai && !generator.gemini) {
+    if (!generator.customImageClient && !generator.openai && !generator.gemini) {
       return { status: 'warning', message: 'No AI image provider is configured; gradient visuals will be used.', remediation: 'Configure OpenAI or Gemini image access if generated visuals are required.' };
     }
     if (!includePaidMedia) {
